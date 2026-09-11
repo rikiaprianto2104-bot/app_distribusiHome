@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pemindai SKU — WMS</title>
+<style>
+  :root{--navy:#1B2A7A;--ink:#111634;--bg:#F5F6FA;--line:#e4e7f0;--muted:#6b7086;--ok:#128A63;--err:#C62828}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:#0c0e18;color:#fff;font-family:Roboto,system-ui,-apple-system,sans-serif;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:10px;padding:14px 16px;padding-top:calc(14px + env(safe-area-inset-top))}
+  header h1{font-size:15px;font-weight:500;margin:0}
+  .stage{position:relative;flex:1;min-height:240px;background:#15182a;overflow:hidden}
+  video{width:100%;height:100%;object-fit:cover;display:block;background:#15182a}
+  .reticle{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+  .reticle > div{width:76%;height:46%;border:2px solid rgba(255,255,255,.85);border-radius:14px;box-shadow:0 0 0 2000px rgba(0,0,0,.45);position:relative}
+  .reticle span{position:absolute;left:8%;right:8%;height:2px;background:#4DE1C1;box-shadow:0 0 10px #4DE1C1;animation:sl 1.6s ease-in-out infinite alternate}
+  @keyframes sl{0%{top:8%}100%{top:88%}}
+  .engine{position:absolute;left:12px;bottom:10px;font-size:10px;letter-spacing:.4px;color:#cfd4ff;background:rgba(0,0,0,.5);padding:5px 8px;border-radius:6px}
+  .msg{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;padding:24px;background:#15182a}
+  .msg b{font-size:15px;font-weight:500}
+  .msg b.err{color:#ff8a80}
+  .msg p{margin:0;font-size:12.5px;color:#9AA1C4;max-width:300px;line-height:1.5}
+  .msg .spin{width:26px;height:26px;border-radius:50%;border:3px solid rgba(255,255,255,.18);border-top-color:#4DE1C1;animation:sp .8s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .msg button{margin-top:4px}
+  .sheet{background:var(--bg);color:var(--ink);border-radius:18px 18px 0 0;margin-top:-14px;padding:16px 16px calc(16px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:10px}
+  .hit{font:500 15px/1.2 'Roboto Mono',monospace;letter-spacing:.5px;background:#E4F6EF;color:var(--ok);border-radius:10px;padding:12px;text-align:center;display:none}
+  .row{display:flex;gap:8px}
+  input{flex:1;min-width:0;height:48px;border:1px solid #d3d7e6;border-radius:10px;padding:0 12px;font-size:15px;color:var(--ink);background:#fff}
+  button{height:48px;border:none;border-radius:10px;background:var(--navy);color:#fff;font:500 14px Roboto,sans-serif;padding:0 16px;cursor:pointer}
+  button.ghost{background:#fff;color:var(--ink);border:1px solid #c9cddd}
+  .hint{font-size:12px;color:var(--muted);line-height:1.5}
+  .diag{font:400 10px/1.5 'Roboto Mono',monospace;color:#5b6390;padding:4px 6px;white-space:pre-wrap;
+        max-height:6.5em;overflow-y:auto;background:#eef0f6;border-radius:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Pemindai SKU</h1>
+</header>
+
+<div class="stage">
+  <video id="v" playsinline muted></video>
+  <div class="reticle" id="reticle" hidden><div><span></span></div></div>
+  <div class="engine" id="engine" hidden></div>
+  <div class="msg" id="msg"></div>
+</div>
+
+<div class="sheet">
+  <div class="hit" id="hit"></div>
+  <div class="row">
+    <input id="manual" placeholder="Ketik kode SKU" autocomplete="off" autocapitalize="characters" enterkeyhint="go">
+    <button id="add">Kirim</button>
+  </div>
+  <div class="row">
+    <button class="ghost" id="close" style="flex:1">Tutup</button>
+  </div>
+  <div class="hint" id="hint">Hasil scan otomatis dikirim ke form dan jendela ini tertutup.</div>
+  <div class="diag" id="diag"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var v = document.getElementById('v');
+  var msgEl = document.getElementById('msg');
+  var reticle = document.getElementById('reticle');
+  var engineEl = document.getElementById('engine');
+  var hitEl = document.getElementById('hit');
+  var diagEl = document.getElementById('diag');
+
+  var CAMERA_TIMEOUT_MS = 9000;    // batas tunggu getUserMedia / video menyala
+  var DETECT_PROBE_MS = 4000;      // batas uji pertama BarcodeDetector.detect()
+  var DETECT_LOOP_MS = 3000;       // batas tiap panggilan detect() berikutnya
+  var stream = null, reader = null, detector = null, pollTimer = null;
+  var done = false, lastText = '', lastAt = 0, starting = false, nativeFailStreak = 0, running = false;
+
+  var hasOpener = false;
+  try { hasOpener = !!(window.opener && !window.opener.closed); } catch (e) { hasOpener = !!window.opener; }
+
+  /* ---------- diagnosa: simpan & tampilkan beberapa langkah terakhir ---------- */
+  var logLines = [];
+  function log(step) {
+    try {
+      var t = new Date().toTimeString().slice(0, 8);
+      logLines.push('[' + t + '] ' + step);
+      if (logLines.length > 10) logLines.shift();
+      diagEl.textContent = logLines.join('\n');
+      diagEl.scrollTop = diagEl.scrollHeight;
+      console.log('[WMS-scan]', step);
+    } catch (e) {}
+  }
+
+  function setMsg(opts) {
+    // opts: { title, sub, spin, err, retry, retryLabel }
+    msgEl.hidden = false;
+    var html = '';
+    if (opts.spin) html += '<div class="spin"></div>';
+    html += '<b class="' + (opts.err ? 'err' : '') + '">' + opts.title + '</b>';
+    if (opts.sub) html += '<p>' + opts.sub + '</p>';
+    msgEl.innerHTML = html;
+    if (opts.retry) {
+      var btn = document.createElement('button');
+      btn.textContent = opts.retryLabel || 'Coba Lagi';
+      btn.addEventListener('click', start);
+      msgEl.appendChild(btn);
+    }
+  }
+  function hideMsg() { msgEl.hidden = true; }
+
+  /* ---------- kirim hasil scan ---------- */
+  function send(code) {
+    code = String(code || '').trim().toUpperCase();
+    if (!code) return;
+    var now = Date.now();
+    if (code === lastText && now - lastAt < 1500) return;
+    lastText = code; lastAt = now;
+    if (navigator.vibrate) { try { navigator.vibrate(60); } catch (e) {} }
+    log('barcode terbaca: ' + code);
+
+    var posted = false;
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: 'wms-sku', sku: code }, '*');
+        posted = true;
+      }
+    } catch (e) { posted = false; }
+
+    if (posted) {
+      stopCamera();
+      setMsg({ title: 'Terkirim: ' + code, sub: 'Menutup jendela…' });
+      setTimeout(function () {
+        try { window.close(); } catch (e) {}
+        hitEl.style.display = 'block';
+        hitEl.textContent = code + ' — sudah terkirim, jendela ini boleh ditutup';
+      }, 400);
+    } else {
+      done = true; stopCamera();
+      hitEl.style.display = 'block';
+      hitEl.textContent = code + '  (ketuk untuk salin)';
+      hitEl.onclick = function () {
+        try { navigator.clipboard.writeText(code); hitEl.textContent = code + '  ✓ disalin'; } catch (e) {}
+      };
+      setMsg({ title: 'Barcode terbaca', sub: 'Kembali ke form lalu tempel kodenya, atau tekan "Coba Lagi" untuk scan lagi.', retry: true, retryLabel: 'Scan lagi' });
+    }
+  }
+
+  /* ---------- util: batasi sebuah promise dengan timeout ---------- */
+  function withTimeout(promise, ms, label) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var t = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        reject(new Error('TIMEOUT: ' + label + ' tidak merespon dalam ' + (ms / 1000) + ' detik.'));
+      }, ms);
+      promise.then(function (val) {
+        if (settled) return; settled = true; clearTimeout(t); resolve(val);
+      }, function (err) {
+        if (settled) return; settled = true; clearTimeout(t); reject(err);
+      });
+    });
+  }
+
+  /* ---------- ZXing (lazy) ---------- */
+  function loadZxing() {
+    return withTimeout(new Promise(function (resolve, reject) {
+      if (window.ZXing && window.ZXing.BrowserMultiFormatReader) return resolve();
+      var srcs = [
+        'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js',
+        'https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js'
+      ];
+      var i = 0;
+      function tryNext() {
+        if (i >= srcs.length) return reject(new Error('Gagal memuat pustaka ZXing dari semua sumber.'));
+        var s = document.createElement('script');
+        s.src = srcs[i++];
+        s.onload = function () {
+          (window.ZXing && window.ZXing.BrowserMultiFormatReader) ? resolve() : tryNext();
+        };
+        s.onerror = tryNext;
+        document.head.appendChild(s);
+      }
+      tryNext();
+    }), CAMERA_TIMEOUT_MS, 'Memuat pustaka ZXing');
+  }
+
+  /**
+   * Panggilan detector.detect() DIBUNGKUS TIMEOUT — di sebagian Android tanpa
+   * Google Play Services penuh (mis. banyak HP Huawei/HMS), BarcodeDetector.detect()
+   * bisa MENGGANTUNG selamanya (bukan resolve/reject) karena API ini diam-diam
+   * bergantung pada modul deteksi barcode dari Play Services / ML Kit yang tidak
+   * ada di perangkat tsb. Tanpa timeout ini, layar macet tanpa pesan apa pun.
+   */
+  function detectOnce(ms) {
+    if (!detector) return Promise.reject(new Error('detector tidak aktif'));
+    return withTimeout(detector.detect(v), ms, 'BarcodeDetector.detect()');
+  }
+
+  // Uji BarcodeDetector sekali dengan timeout PENDEK sebelum benar-benar dipakai.
+  // Kalau tidak merespon (device tanpa dukungan penuh) -> langsung pindah ke ZXing,
+  // tanpa menahan pengguna menunggu di layar hitam.
+  function probeNative() {
+    log('menguji BarcodeDetector (maks ' + (DETECT_PROBE_MS / 1000) + ' dtk)…');
+    setMsg({ title: 'Menyiapkan pemindai…', sub: 'Menguji BarcodeDetector…', spin: true });
+    detectOnce(DETECT_PROBE_MS).then(function () {
+      if (!running) return;
+      log('BarcodeDetector merespon — dipakai.');
+      hideMsg(); reticle.hidden = false;
+      engineEl.hidden = false; engineEl.textContent = 'BarcodeDetector';
+      nativeFailStreak = 0;
+      pollTimer = setTimeout(runNativeLoop, 50);
+    }).catch(function (e) {
+      if (!running) return;
+      log('BarcodeDetector tidak merespon (' + (e && e.message) + '); pindah ke ZXing.');
+      detector = null;
+      startZxing();
+    });
+  }
+
+  function runNativeLoop() {
+    if (!running || done) return;
+    if (v.readyState < 2) { pollTimer = setTimeout(runNativeLoop, 200); return; }
+    detectOnce(DETECT_LOOP_MS).then(function (codes) {
+      if (!running) return;
+      nativeFailStreak = 0;
+      if (codes && codes.length) send(codes[0].rawValue);
+      if (!done) pollTimer = setTimeout(runNativeLoop, 300);
+    }).catch(function (e) {
+      if (!running) return;
+      nativeFailStreak++;
+      var isTimeout = /^Timeout/i.test((e && e.message) || '');
+      log('detect() gagal' + (isTimeout ? ' (timeout)' : '') + ': ' + (e && e.message));
+      // timeout = bukti kuat API rusak di device ini -> pindah sekarang juga;
+      // rejection biasa (jarang, transient) -> coba beberapa kali dulu.
+      if (isTimeout || nativeFailStreak >= 3) {
+        detector = null;
+        startZxing();
+        return;
+      }
+      if (!done) pollTimer = setTimeout(runNativeLoop, 300);
+    });
+  }
+
+  function startZxing() {
+    if (!running) return;
+    log('memuat ZXing…');
+    setMsg({ title: 'Menyiapkan pemindai…', sub: 'Memuat pustaka ZXing…', spin: true });
+    loadZxing().then(function () {
+      if (done || !running) return;
+      log('ZXing siap, mulai decode…');
+      try {
+        reader = new window.ZXing.BrowserMultiFormatReader();
+        var handler = function (result) { if (result) send(result.getText ? result.getText() : result.text); };
+        if (stream && reader.decodeFromStream) reader.decodeFromStream(stream, v, handler);
+        else if (reader.decodeFromConstraints) reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' } } }, v, handler);
+        else reader.decodeFromVideoDevice(null, v, handler);
+        hideMsg(); reticle.hidden = false;
+        engineEl.hidden = false; engineEl.textContent = 'ZXing';
+      } catch (e) {
+        fail('Pemindai (ZXing) gagal dijalankan', e);
+      }
+    }).catch(function (e) { fail('Gagal memuat pustaka pemindai', e); });
+  }
+
+  /* ---------- ambil kamera: beberapa constraint dicoba berurutan ---------- */
+  // Kalau constraint pertama menghasilkan stream yang "valid" tapi videonya tidak
+  // pernah dapat frame (device tertentu memilih kamera/mode yang bermasalah untuk
+  // facingMode tertentu), kita coba constraint yang makin longgar sebelum menyerah.
+  var CAMERA_ATTEMPTS = [
+    { label: 'kamera belakang (facingMode ideal)', constraints: { video: { facingMode: { ideal: 'environment' } }, audio: false } },
+    { label: 'kamera apa saja (tanpa facingMode)', constraints: { video: true, audio: false } }
+  ];
+
+  function describeTrack(s) {
+    try {
+      var t = s.getVideoTracks()[0];
+      if (!t) return 'stream tidak punya video track';
+      var st = (t.getSettings && t.getSettings()) || {};
+      return 'track="' + (t.label || '(tanpa label)') + '" readyState=' + t.readyState + ' muted=' + t.muted +
+        (st.width ? (' ' + st.width + 'x' + st.height) : '') +
+        (st.facingMode ? (' facing=' + st.facingMode) : '') +
+        (st.frameRate ? (' fps=' + st.frameRate) : '');
+    } catch (e) { return 'gagal baca info track: ' + (e && e.message); }
+  }
+
+  function watchTrack(s) {
+    try {
+      var t = s.getVideoTracks()[0];
+      if (!t) return;
+      t.onmute = function () { log('track video: onmute (kamera berhenti kirim frame)'); };
+      t.onunmute = function () { log('track video: onunmute (frame mengalir lagi)'); };
+      t.onended = function () { log('track video: onended (kamera berhenti total)'); };
+    } catch (e) {}
+  }
+
+  // video.play() dilog eksplisit di setiap kemungkinan hasil: resolve, reject,
+  // melempar langsung, atau (kasus lain yang pernah ditemukan) tidak pernah selesai.
+  function callPlay() {
+    log('memanggil video.play()…');
+    var playP;
+    try { playP = v.play(); } catch (e) { log('video.play() melempar langsung: ' + (e && e.message)); return; }
+    if (!playP || !playP.then) { log('video.play() tidak mengembalikan promise (browser lama/tidak standar).'); return; }
+    withTimeout(playP, 4000, 'video.play()').then(function () {
+      log('video.play() berhasil (playback dimulai).');
+    }, function (e) {
+      log('video.play() GAGAL: ' + (e && e.name) + ' — ' + (e && e.message));
+    });
+  }
+
+  function waitVideoReady() {
+    if (v.readyState >= 2) return Promise.resolve();
+    return withTimeout(new Promise(function (resolve) {
+      var onReady = function () { cleanup(); resolve(); };
+      var onErr = function () { cleanup(); resolve(); }; // tetap lanjut; deteksi akan menampilkan errornya sendiri kalau perlu
+      function cleanup() {
+        v.removeEventListener('loadeddata', onReady);
+        v.removeEventListener('canplay', onReady);
+        v.removeEventListener('error', onErr);
+      }
+      v.addEventListener('loadeddata', onReady);
+      v.addEventListener('canplay', onReady);
+      v.addEventListener('error', onErr);
+    }), CAMERA_TIMEOUT_MS, 'Video kamera (menunggu frame pertama)');
+  }
+
+  function stopStream(s) {
+    try { (s || stream).getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+  }
+
+  // Coba satu constraint: minta stream -> pasang ke <video> -> play() -> tunggu frame.
+  // Reject kalau salah satu langkah gagal/timeout (video-nya sendiri di-stop dulu).
+  function attemptCamera(attempt) {
+    log('mencoba ' + attempt.label + '…');
+    setMsg({ title: 'Meminta izin kamera…', sub: attempt.label + ' (maks ' + (CAMERA_TIMEOUT_MS / 1000) + ' dtk)', spin: true });
+
+    return withTimeout(navigator.mediaDevices.getUserMedia(attempt.constraints), CAMERA_TIMEOUT_MS, 'getUserMedia (' + attempt.label + ')')
+      .then(function (s) {
+        stream = s;
+        log('stream didapat (' + attempt.label + '): ' + describeTrack(s));
+        watchTrack(s);
+        v.srcObject = s;
+        v.muted = true; v.playsInline = true; v.autoplay = true;
+        setMsg({ title: 'Menyalakan video…', sub: attempt.label, spin: true });
+        callPlay();
+        return waitVideoReady().catch(function (err) {
+          log('video tidak menyala dengan ' + attempt.label + ': ' + (err && err.message) + ' | info track: ' + describeTrack(s));
+          stopStream(s); stream = null;
+          throw err;
+        });
+      });
+  }
+
+  function acquireCamera(i) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('Browser ini tidak mendukung akses kamera (getUserMedia tidak ada). Gunakan input ketik di bawah.'));
+    }
+    i = i || 0;
+    if (i >= CAMERA_ATTEMPTS.length) {
+      return Promise.reject(new Error('Semua mode kamera sudah dicoba (' +
+        CAMERA_ATTEMPTS.map(function (a) { return a.label; }).join(', ') +
+        '), video tidak pernah menyala. Kemungkinan masalah driver kamera di browser/perangkat ini.'));
+    }
+    return attemptCamera(CAMERA_ATTEMPTS[i]).catch(function (err) {
+      if (err && err.name === 'NotAllowedError') throw err; // izin ditolak: percuma coba mode lain
+      if (i + 1 >= CAMERA_ATTEMPTS.length) throw err;
+      return acquireCamera(i + 1);
+    });
+  }
+
+  function fail(title, err) {
+    var detail = (err && err.message) || String(err || '');
+    log('GAGAL: ' + title + ' — ' + detail);
+    reticle.hidden = true;
+    engineEl.hidden = true;
+    var sub = detail;
+    if (err && err.name === 'NotAllowedError') {
+      sub = 'Izin kamera ditolak / dicabut. Buka setelan situs di browser lalu izinkan Kamera untuk halaman ini, lalu coba lagi.';
+    } else if (err && err.name === 'NotFoundError') {
+      sub = 'Tidak menemukan kamera pada perangkat ini.';
+    } else if (err && err.name === 'NotReadableError') {
+      sub = 'Kamera sedang dipakai aplikasi lain. Tutup aplikasi kamera/video call lain lalu coba lagi.';
+    } else if (detail.indexOf('TIMEOUT') === 0) {
+      sub = detail + ' Browser ini kemungkinan tidak merespon permintaan kamera dengan benar. Coba: buka dengan Chrome, refresh halaman, atau pakai input ketik SKU di bawah (tetap berfungsi penuh).';
+    }
+    setMsg({ title: title, sub: sub, err: true, retry: true });
+  }
+
+  function stopCamera() {
+    running = false;
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    nativeFailStreak = 0;
+    detector = null;
+    try { if (reader) reader.reset(); } catch (e) {} reader = null;
+    if (stream) { try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} stream = null; }
+  }
+
+  function start() {
+    if (starting) return;
+    starting = true; running = true;
+    done = false; lastText = '';
+    hitEl.style.display = 'none';
+    reticle.hidden = true; engineEl.hidden = true;
+    setMsg({ title: 'Meminta izin kamera…', sub: 'Izinkan akses kamera saat diminta. (maks ' + (CAMERA_TIMEOUT_MS / 1000) + ' dtk)', spin: true });
+
+    acquireCamera(0)
+      .then(function () {
+        log('video siap, memilih mesin pemindai…');
+        starting = false;
+
+        if ('BarcodeDetector' in window) {
+          try {
+            detector = new window.BarcodeDetector({
+              formats: ['code_128', 'code_39', 'code_93', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'itf', 'codabar', 'qr_code', 'data_matrix', 'pdf417']
+            });
+          } catch (e) { try { detector = new window.BarcodeDetector(); } catch (e2) { detector = null; } }
+        }
+        if (detector) probeNative();
+        else startZxing();
+      })
+      .catch(function (err) {
+        starting = false;
+        stopCamera();
+        fail('Kamera tidak bisa diaktifkan', err);
+      });
+  }
+
+  /* ---------- input manual & tombol ---------- */
+  document.getElementById('add').addEventListener('click', function () {
+    var val = document.getElementById('manual').value.trim();
+    if (val) { document.getElementById('manual').value = ''; send(val); }
+  });
+  document.getElementById('manual').addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    var val = e.target.value.trim();
+    if (val) { e.target.value = ''; send(val); }
+  });
+  document.getElementById('close').addEventListener('click', function () {
+    stopCamera();
+    try { window.close(); } catch (e) {}
+    setMsg({ title: 'Jendela boleh ditutup' });
+  });
+  window.addEventListener('pagehide', stopCamera);
+
+  /* ---------- jaring pengaman: jangan pernah gagal diam-diam ---------- */
+  window.addEventListener('error', function (ev) {
+    log('window.onerror: ' + (ev && ev.message));
+    fail('Terjadi kesalahan skrip', new Error((ev && ev.message) || 'unknown error'));
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    var reason = ev && ev.reason;
+    log('unhandledrejection: ' + (reason && reason.message || reason));
+    fail('Terjadi kesalahan tak terduga', reason instanceof Error ? reason : new Error(String(reason)));
+  });
+
+  if (!hasOpener) {
+    document.getElementById('hint').textContent =
+      'Jendela ini dibuka manual. Barcode yang terbaca ditampilkan agar bisa disalin.';
+  }
+
+  // Mulai lewat tap tombol, BUKAN otomatis saat halaman dibuka: beberapa browser
+  // (mis. Huawei Browser) memproses getUserMedia lebih andal saat dipicu langsung
+  // oleh gesture user, dan ini juga memberi kita titik "Coba Lagi" yang jelas.
+  setMsg({ title: 'Siap memindai', sub: 'Tekan tombol di bawah untuk mengaktifkan kamera.', retry: true, retryLabel: 'Aktifkan Kamera' });
+})();
+</script>
+</body>
+</html>
